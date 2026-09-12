@@ -4,5 +4,6 @@
 # likely break GPU support. This file covers only what Colab may be
 # missing or have at an incompatible version.
 kaggle>=1.6
+kagglehub>=0.3
 pandas==3.0.5
 scikit-learn==1.9.1

@@ -64,7 +64,24 @@ class BinaryFocalLoss(nn.Module):
         ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         p_t = p * targets + (1 - p) * (1 - targets)
         modulating = (1 - p_t) ** self.gamma
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
+
+        # NOTE: this intentionally does NOT use the textbook
+        # `alpha*targets + (1-alpha)*(1-targets)` split. That formula only
+        # stays non-negative when alpha is a single scalar in [0, 1]
+        # (RetinaNet's original use case: one alpha shared across all
+        # classes). Here `alpha` can be a per-class tensor from
+        # `effective_number_alpha`, which deliberately produces values above
+        # 1 for rare classes (e.g. Hernia measured at ~3.65, see
+        # docs/training_strategy.md class-prevalence table) so that rare
+        # positives get amplified. Plugging alpha>1 into `(1-alpha)` for the
+        # negative term goes negative, which flips the loss's sign on every
+        # negative sample of that class and rewards the model for being
+        # *more* wrong -- this caused the model's logits to diverge without
+        # bound during a real training run. Weighting only the positive term
+        # by alpha and leaving negatives at a constant weight of 1 keeps the
+        # loss non-negative for any alpha >= 0, matching the actual intent
+        # (correct for positive-class rarity, not negative-class balance).
+        alpha_t = self.alpha * targets + (1 - targets)
 
         loss = alpha_t * modulating * ce
         if self.reduction == "mean":
