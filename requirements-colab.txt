@@ -1,0 +1,8 @@
+# Colab already ships a CUDA-linked torch/torchvision matching its GPU
+# runtime -- do NOT install requirements.txt's pinned torch==2.14.0 /
+# torchvision==0.29.0 on top of it, that would replace the CUDA build and
+# likely break GPU support. This file covers only what Colab may be
+# missing or have at an incompatible version.
+kaggle>=1.6
+pandas==3.0.5
+scikit-learn==1.9.1
