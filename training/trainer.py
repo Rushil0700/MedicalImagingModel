@@ -1,9 +1,6 @@
-"""Training loop for ChestXRayMaxViT-v2.
-
-Implements docs/training_strategy.md sections 1, 5, 7: AdamW + cosine
-schedule with linear warmup, mixed precision, gradient clipping, early
-stopping on validation mean per-class F1, and full per-class metric logging
-persisted alongside every checkpoint.
+"""MedicalImageTrainer: AdamW + cosine schedule with warmup, mixed precision,
+gradient clipping, early stopping on validation mean per-class F1, and
+checkpoint resume support (for continuing after a Colab session disconnect).
 """
 from __future__ import annotations
 
@@ -18,9 +15,10 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 
-from src.config import TrainConfig
-from src.losses.combined_loss import CombinedLoss
-from src.training.metrics import compute_per_class_metrics, format_metrics_table
+from config.config import TrainConfig
+from training.losses import ChestMedicalNetLoss
+from training.metrics import compute_per_class_metrics, format_metrics_table
+from utils.helpers import assemble_disease_probs
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +36,6 @@ def resolve_device(device_cfg: str) -> torch.device:
 def build_warmup_cosine_scheduler(
     optimizer: torch.optim.Optimizer, warmup_epochs: int, t_max: int, eta_min: float, base_lr: float
 ) -> LambdaLR:
-    """Linear warmup for `warmup_epochs`, then cosine decay to `eta_min` by epoch `t_max`."""
-
     def lr_lambda(epoch: int) -> float:
         if epoch < warmup_epochs:
             return (epoch + 1) / warmup_epochs
@@ -51,15 +47,32 @@ def build_warmup_cosine_scheduler(
     return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
-class Trainer:
+class MedicalImageTrainer:
+    """Trainer for ChestMedicalNet (model_type='chest', model_name='custom').
+
+    Other (model_type, model_name) combinations from the project spec (the
+    lungs model; the 6 modified pretrained-model variants) are not wired up
+    yet -- see models/custom_architectures.py::LungsMedicalNet and the
+    project status notes for why.
+    """
+
     def __init__(
         self,
         model: torch.nn.Module,
-        loss_fn: CombinedLoss,
+        loss_fn: ChestMedicalNetLoss,
         train_loader: DataLoader,
         val_loader: DataLoader,
         cfg: TrainConfig,
+        model_type: str = "chest",
+        model_name: str = "custom",
     ) -> None:
+        if model_type != "chest" or model_name != "custom":
+            raise NotImplementedError(
+                f"MedicalImageTrainer only supports model_type='chest', model_name='custom' "
+                f"currently (got model_type={model_type!r}, model_name={model_name!r}). "
+                "The lungs model and the 6 modified pretrained-model variants are not "
+                "implemented -- see project status notes."
+            )
         self.model = model
         self.loss_fn = loss_fn
         self.train_loader = train_loader
@@ -70,9 +83,7 @@ class Trainer:
         self.model.to(self.device)
         self.loss_fn.to(self.device)
 
-        self.optimizer = AdamW(
-            model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay
-        )
+        self.optimizer = AdamW(model.parameters(), lr=cfg.optim.lr, weight_decay=cfg.optim.weight_decay)
         self.scheduler = build_warmup_cosine_scheduler(
             self.optimizer,
             warmup_epochs=cfg.optim.warmup_epochs,
@@ -90,11 +101,6 @@ class Trainer:
         cfg.log_dir.mkdir(parents=True, exist_ok=True)
 
     def resume(self, checkpoint_path: Path) -> None:
-        """Restore model/optimizer/scheduler/scaler state and epoch counters
-        from a checkpoint saved by `_save_checkpoint`, so training can
-        continue after an interruption (e.g. a disconnected Colab session)
-        without losing optimizer momentum or scheduler position.
-        """
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -103,17 +109,13 @@ class Trainer:
         self.start_epoch = ckpt["epoch"] + 1
         self.best_val_f1 = ckpt.get("best_val_f1", ckpt["val_metrics"]["__mean__"]["f1"])
         self.epochs_without_improvement = ckpt.get("epochs_without_improvement", 0)
-        logger.info(
-            "Resumed from %s: starting at epoch %d, best_val_f1=%.4f",
-            checkpoint_path, self.start_epoch, self.best_val_f1,
-        )
+        logger.info("Resumed from %s: starting at epoch %d, best_val_f1=%.4f",
+                    checkpoint_path, self.start_epoch, self.best_val_f1)
 
     def _to_device(self, batch: dict) -> dict:
-        return {
-            k: (v.to(self.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()
-        }
+        return {k: (v.to(self.device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
 
-    def train_one_epoch(self, epoch: int) -> float:
+    def train_epoch(self, epoch: int) -> float:
         self.model.train()
         running_loss = 0.0
         amp_dtype = torch.float16 if self.device.type == "cuda" else torch.bfloat16
@@ -122,9 +124,7 @@ class Trainer:
             batch = self._to_device(batch)
             self.optimizer.zero_grad(set_to_none=True)
 
-            with torch.autocast(
-                device_type=self.device.type, dtype=amp_dtype, enabled=self.cfg.optim.use_amp
-            ):
+            with torch.autocast(device_type=self.device.type, dtype=amp_dtype, enabled=self.cfg.optim.use_amp):
                 outputs = self.model(batch["image"])
                 losses = self.loss_fn(outputs, batch)
 
@@ -137,34 +137,33 @@ class Trainer:
             running_loss += losses["total"].item()
             if step % 50 == 0:
                 logger.debug(
-                    "epoch %d step %d/%d loss=%.4f focal=%.4f severity=%.4f",
+                    "epoch %d step %d/%d loss=%.4f general=%.4f pneumonia=%.4f tb=%.4f severity=%.4f",
                     epoch, step, len(self.train_loader), losses["total"].item(),
-                    losses["focal"].item(), losses["severity"].item(),
+                    losses["general_focal"].item(), losses["pneumonia_focal"].item(),
+                    losses["tb_loss"].item(), losses["severity"].item(),
                 )
 
         self.scheduler.step()
         return running_loss / len(self.train_loader)
 
     @torch.no_grad()
-    def evaluate(self, loader: DataLoader) -> dict:
+    def validate_epoch(self, loader: DataLoader) -> dict:
         self.model.eval()
         all_probs, all_targets = [], []
-
         for batch in loader:
             batch = self._to_device(batch)
             outputs = self.model(batch["image"])
-            probs = torch.sigmoid(outputs["disease_mean"])
-            all_probs.append(probs.cpu().numpy())
+            all_probs.append(assemble_disease_probs(outputs).cpu().numpy())
             all_targets.append(batch["disease_target"].cpu().numpy())
 
         y_prob = np.concatenate(all_probs, axis=0)
         y_true = np.concatenate(all_targets, axis=0)
         return compute_per_class_metrics(y_true, y_prob)
 
-    def fit(self) -> None:
+    def train(self) -> None:
         for epoch in range(self.start_epoch, self.cfg.optim.max_epochs):
-            train_loss = self.train_one_epoch(epoch)
-            val_metrics = self.evaluate(self.val_loader)
+            train_loss = self.train_epoch(epoch)
+            val_metrics = self.validate_epoch(self.val_loader)
             val_f1 = val_metrics["__mean__"]["f1"]
 
             logger.info("Epoch %d train_loss=%.4f val_mean_f1=%.4f", epoch, train_loss, val_f1)
@@ -177,17 +176,13 @@ class Trainer:
             else:
                 self.epochs_without_improvement += 1
 
-            # Always save "last" so a disconnected session can resume from the
-            # most recent epoch, not just the best-so-far one.
             self._save_checkpoint(epoch, val_metrics, filename="last_checkpoint.pt")
             if is_best:
                 self._save_checkpoint(epoch, val_metrics, filename="best_model.pt")
 
             if self.epochs_without_improvement >= self.cfg.optim.early_stop_patience:
-                logger.info(
-                    "Early stopping at epoch %d (no val F1 improvement for %d epochs)",
-                    epoch, self.cfg.optim.early_stop_patience,
-                )
+                logger.info("Early stopping at epoch %d (no val F1 improvement for %d epochs)",
+                            epoch, self.cfg.optim.early_stop_patience)
                 break
 
     def _save_checkpoint(self, epoch: int, val_metrics: dict, filename: str) -> None:

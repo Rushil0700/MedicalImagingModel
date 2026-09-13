@@ -1,13 +1,37 @@
-# ChestXRayMaxViT-v2
+# Medical Imaging AI — ChestMedicalNet
 
-Enhanced NIH ChestX-ray14 classifier, targeting 92%+ per-class F1 / 0.95+ AUC-ROC
-from an 87% F1 / 0.935 AUC baseline (`ChestXRayMaxViT`, 38M params).
+A ConvNeXt-based, multi-pathway chest X-ray classifier for NIH ChestX-ray14, with a Feature Pyramid Network, CBAM attention, Bayesian uncertainty quantification, and an auxiliary CORAL ordinal severity head.
 
-Design rationale for every architectural and training decision lives in `docs/`:
+## Project status (read this first)
 
-- [`docs/architecture_analysis.md`](docs/architecture_analysis.md) — baseline breakdown, measured bottlenecks, SOTA comparison
-- [`docs/enhanced_architecture_spec.md`](docs/enhanced_architecture_spec.md) — full v2 architecture spec, with a correction note recording where the original param-count estimate was wrong and how it was fixed
-- [`docs/training_strategy.md`](docs/training_strategy.md) — optimizer/schedule/loss/augmentation/metrics strategy, grounded in the real NIH ChestX-ray14 label distribution
+This project's scope was expanded mid-stream to a larger "chest + lungs + RAG router" system. Here is what's real versus what's a placeholder, stated plainly:
+
+| Component | Status |
+|---|---|
+| **ChestMedicalNet** (`models/custom_architectures.py`) | Real, implemented, unit-tested (`tests/test_models.py`), smoke-tested end-to-end against real data (forward/backward pass, no divergence over multiple optimizer steps). |
+| Pneumonia pathway | Real and trainable — NIH ChestX-ray14 has a genuine Pneumonia label. |
+| General pathway (13 other NIH pathologies) | Real and trainable. |
+| **TB pathway** | Architecturally present, **not trainable on this project's data**. NIH ChestX-ray14 has no TB label at all. Targets are always "unknown" and masked out of the loss (see `config/config.py::TB_LABEL_AVAILABLE`). Do not treat its output as a real TB classifier without adding a TB-labeled dataset (e.g. Shenzhen, Montgomery, TBX11K). |
+| Severity head (CORAL ordinal) | Architecturally present, **not trainable** — NIH ChestX-ray14 has no severity grading either. Trains as a no-op unless `DataConfig.severity_labels_path` is supplied. |
+| **LungsMedicalNet** (`models/custom_architectures.py`) | **Skeleton only.** Raises `NotImplementedError` on instantiation. This project has no lung CT data (LUNA16/LIDC-IDRI) and no loader for it. |
+| CheXpert / MIMIC-CXR loaders (`data/dataset.py`) | Stubbed, raise `NotImplementedError`. Both need separate, credentialed access — MIMIC-CXR specifically requires a PhysioNet data-use agreement and a completed human-subjects research training course, which cannot be automated. |
+| RAG router (`inference/rag_router.py`) | Real, working chest-only routing + embedding-based similar-case retrieval (in-memory, not a persistent vector DB) + reasoning/recommendation text. "Image type detection" always returns `chest` since there's no lungs model to route to. |
+| Grad-CAM localization (`inference/visualization.py`) | Real, implemented as the actual post-hoc technique (gradient-weighted activation maps), not a trained "head" — the original spec's phrasing was imprecise about what Grad-CAM is. |
+| 6 modified pretrained-model variants (ViT/ConvNeXt/EfficientNet/ResNet/DenseNet/hybrid) | **Not built.** Sequenced as future work once ChestMedicalNet itself has real training results. |
+
+Realistic performance targets stated elsewhere (99% TB/cancer sensitivity, 95-96% F1) are **not validated claims** — they require data and validation this project does not currently have. Treat them as aspirational, not as guaranteed outcomes.
+
+## Architecture
+
+`models/custom_architectures.py::ChestMedicalNet`:
+1. **ConvNeXt-Base backbone** (`models/backbone.py`) — ~89M params, chosen over ConvNeXt-Large (~198M) to stay trainable on a free-tier Colab T4 (16GB); configurable via `ChestModelConfig.backbone`.
+2. **Feature Pyramid Network** (`models/fpn.py`) — fuses strides 4/8/16/32.
+3. **CBAM attention** (`models/attention.py`) — channel + spatial, per pyramid level.
+4. **Disease-specific pathways**: TB (binary, untrained — see above), Pneumonia (binary, real), General (13-class, Bayesian mean+log-variance for uncertainty).
+5. **CORAL ordinal severity head** (untrained — see above).
+6. **MC Dropout** (`models/uncertainty.py`) for epistemic uncertainty, combined with the general pathway's learned aleatoric variance.
+
+Total measured parameters: ~91M.
 
 ## Setup
 
@@ -16,34 +40,24 @@ python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Requires the NIH ChestX-ray14 archive at `archive/` (already present: `Data_Entry_2017.csv` + `images_001/` … `images_012/`).
-
-## Architecture (implemented, measured)
-
-`src/models/chest_xray_maxvit_v2.py` assembles:
-
-1. **`MaxViTBackbone`** (`src/models/backbone.py`) — `torchvision.models.maxvit.MaxVit` configured with `[3,3,9,3]` blocks at the baseline's `[64,128,256,512]` channel widths, exposing all 4 stage outputs instead of only the last.
-2. **`FeaturePyramidNetwork`** (`src/models/fpn.py`) — fuses strides 4/8/16/32 top-down into a common 256-channel width.
-3. **`CBAM`** (`src/models/attention.py`) — channel + spatial attention at each fused pyramid level.
-4. **`SharedTrunk` + `DiseaseHead` + `SeverityHead`** (`src/models/heads.py`) — multi-task head: a Bayesian (mean, log-variance) disease head plus an auxiliary CORAL ordinal severity head.
-5. **MC Dropout + Bayesian uncertainty** (`src/models/uncertainty.py`) — `mc_dropout_predict()` runs T=20 stochastic passes at inference and combines epistemic + aleatoric uncertainty into a single `total_std` per class, for flagging low-confidence predictions.
-
-Measured parameter count: **52.0M** (backbone 48.8M + FPN 2.6M + CBAM 0.03M + heads 0.55M) — verified via a smoke test, not estimated. See the correction note at the top of `docs/enhanced_architecture_spec.md`: the original design draft proposed widening channels *and* deepening blocks together, which measured at ~113M, more than double target; keeping channels at baseline width and only deepening hits ~52M.
-
-## Known limitation: no real severity labels
-
-NIH ChestX-ray14 has no ordinal severity annotations — only binary presence/absence per pathology. `SeverityHead` and `CoralOrdinalLoss` are fully implemented and wired in, but `ChestXray14Dataset` returns severity targets of `-1` ("unknown") for every image unless a `severity_labels_path` CSV (Image Index → 14 ordinal grades, sourced from e.g. a radiologist re-annotation effort) is supplied in `DataConfig`. With no such file, the severity loss masks out every sample and trains as a no-op — this is by design, not a bug, and is logged as a warning at startup (`train.py`).
+Requires the NIH ChestX-ray14 archive at `archive/` (`Data_Entry_2017.csv` + `images_001/` … `images_012/`).
 
 ## Training
 
 ```bash
-python train.py
+python main.py train --model chest --architecture custom
 ```
 
-`train.py` builds a patient-level 70/15/15 split (by `Patient ID`, never by raw image — see `src/data/dataset.py` for why), trains with AdamW + cosine schedule + 5-epoch warmup + AMP + gradient clipping (all per `docs/training_strategy.md`), early-stops on validation mean per-class F1 (patience 10), and logs a full per-class metrics table (F1, sensitivity, specificity, AUC-ROC, ECE) every epoch. Checkpoints land in `checkpoints/`, keyed on best validation F1, with the full metrics table saved alongside each one.
+`--model lungs` and any `--architecture` other than `custom` raise `NotImplementedError` — see the status table above for why.
 
-All hyperparameters are in `src/config.py` (`TrainConfig`), grouped into `DataConfig`, `AugmentationConfig`, `ModelConfig`, `LossConfig`, `OptimConfig` — edit there rather than passing CLI flags.
+Patient-level 70/15/15 split (by `Patient ID`, never by raw image — see `data/dataset.py`), AdamW + cosine schedule + warmup + AMP + gradient clipping, early stopping on validation mean per-class F1 (patience 10), full per-class metrics logged every epoch (F1, sensitivity, specificity, AUC-ROC, calibration). Checkpoints in `checkpoints/`, with resume support (`--resume path/to/last_checkpoint.pt`) for continuing after an interrupted session.
 
-## Status
+For quick pipeline validation before committing real compute: `python sanity_check.py`.
 
-Phase 1 (architecture design) and the Phase 2 implementation scaffold (model, losses, data pipeline, training loop, metrics) are complete and have been smoke-tested end-to-end against the real archive data on this machine (forward/backward pass, real `DataLoader` batches, a short real training run). Not yet done: a full training run to convergence, per-component ablation to validate the expected-gain table in `docs/enhanced_architecture_spec.md` section 7, and FLOPs profiling (currently estimates, not measured).
+## Training on Google Colab
+
+See `colab_training.ipynb`. Downloads the dataset via `kagglehub`, mounts Drive for checkpoint persistence, and runs `main.py train`. Push this repo to GitHub and set `REPO_URL` in the notebook's clone cell.
+
+## Background documents
+
+`docs/` contains the original Phase 1 design analysis for an earlier, MaxViT-based single-architecture version of this project (`architecture_analysis.md`, `enhanced_architecture_spec.md`, `training_strategy.md`). The training-strategy reasoning (patient-level splitting, class-balanced focal loss, medical-safe augmentation, sensitivity-prioritized metrics) carried forward into ChestMedicalNet unchanged; the architecture-specific sections describe the superseded MaxViT design, not the current ConvNeXt-based one.

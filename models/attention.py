@@ -1,10 +1,9 @@
 """CBAM-style spatial and channel attention, applied at each FPN level.
 
-Implements docs/enhanced_architecture_spec.md section 3: channel attention
-answers "which fused channels matter", spatial attention answers "which
-pixels matter" — the latter is what gives the model an explicit way to
-localize small/focal findings (Nodule, Mass, Pneumothorax) that the
-baseline's global-pool-only head could not express.
+Channel attention answers "which fused channels matter"; spatial attention
+answers "which pixels matter" -- giving the model an explicit way to
+localize small/focal findings that a global-pool-only head could not
+express.
 """
 from __future__ import annotations
 

@@ -6,19 +6,14 @@ import logging
 import torch
 from torch.utils.data import DataLoader
 
-from src.config import DataConfig, AugmentationConfig
-from src.data.dataset import (
-    ChestXray14Dataset,
-    build_image_index,
-    load_data_entry,
-    patient_level_split,
-)
-from src.data.transforms import build_eval_transform, build_train_transform
+from config.config import AugmentationConfig, DataConfig
+from data.augmentation import build_eval_transform, build_train_transform
+from data.dataset import NIHChestXrayDataset, build_image_index, load_data_entry, patient_level_split
 
 logger = logging.getLogger(__name__)
 
 
-def build_dataloaders(
+def get_dataloaders(
     data_cfg: DataConfig, aug_cfg: AugmentationConfig
 ) -> tuple[DataLoader, DataLoader, DataLoader, "pd.DataFrame", dict]:
     df = load_data_entry(data_cfg.data_entry_csv)
@@ -27,20 +22,18 @@ def build_dataloaders(
         df, data_cfg.train_frac, data_cfg.val_frac, data_cfg.test_frac, data_cfg.split_seed
     )
 
-    train_ds = ChestXray14Dataset(
-        df, splits["train"], image_index,
-        transform=build_train_transform(data_cfg, aug_cfg),
+    common_ds_kwargs = dict(
         severity_labels_path=data_cfg.severity_labels_path,
+        tb_labels_path=data_cfg.tb_labels_path,
     )
-    val_ds = ChestXray14Dataset(
-        df, splits["val"], image_index,
-        transform=build_eval_transform(data_cfg),
-        severity_labels_path=data_cfg.severity_labels_path,
+    train_ds = NIHChestXrayDataset(
+        df, splits["train"], image_index, transform=build_train_transform(data_cfg, aug_cfg), **common_ds_kwargs
     )
-    test_ds = ChestXray14Dataset(
-        df, splits["test"], image_index,
-        transform=build_eval_transform(data_cfg),
-        severity_labels_path=data_cfg.severity_labels_path,
+    val_ds = NIHChestXrayDataset(
+        df, splits["val"], image_index, transform=build_eval_transform(data_cfg), **common_ds_kwargs
+    )
+    test_ds = NIHChestXrayDataset(
+        df, splits["test"], image_index, transform=build_eval_transform(data_cfg), **common_ds_kwargs
     )
 
     common_kwargs = dict(

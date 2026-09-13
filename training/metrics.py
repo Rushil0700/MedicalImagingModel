@@ -1,10 +1,9 @@
 """Per-class evaluation metrics with sensitivity-prioritized thresholding.
 
-Implements docs/training_strategy.md section 6: no single averaged F1 is
-treated as primary. Every metric is computed per class; classes in
-HIGH_URGENCY_CLASSES get their decision threshold chosen to guarantee
-sensitivity >= 90% rather than to maximize F1, per the medical-safety
-requirement that a missed pathology is worse than a false alarm.
+No single averaged F1 is treated as primary. Every metric is computed per
+class; classes in HIGH_URGENCY_CLASSES get their decision threshold chosen
+to guarantee sensitivity >= 90% rather than to maximize F1, since a missed
+pathology is worse than a false alarm.
 """
 from __future__ import annotations
 
@@ -13,7 +12,7 @@ import logging
 import numpy as np
 from sklearn.metrics import brier_score_loss, f1_score, roc_auc_score
 
-from src.config import HIGH_URGENCY_CLASSES, PATHOLOGY_NAMES
+from config.config import HIGH_URGENCY_CLASSES, NIH_PATHOLOGY_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +20,6 @@ MIN_SENSITIVITY_FOR_HIGH_URGENCY = 0.90
 
 
 def _best_f1_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> tuple[float, float]:
-    """Sweep thresholds to find the one maximizing F1 for a single class."""
     thresholds = np.linspace(0.05, 0.95, 19)
     best_threshold, best_f1 = 0.5, 0.0
     for t in thresholds:
@@ -32,7 +30,6 @@ def _best_f1_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> tuple[float, f
 
 
 def _min_sensitivity_threshold(y_true: np.ndarray, y_prob: np.ndarray, min_sensitivity: float) -> float:
-    """Highest threshold (best specificity) that still meets the sensitivity floor."""
     thresholds = np.linspace(0.05, 0.95, 19)
     valid = []
     for t in thresholds:
@@ -46,24 +43,9 @@ def _min_sensitivity_threshold(y_true: np.ndarray, y_prob: np.ndarray, min_sensi
 
 
 def compute_per_class_metrics(
-    y_true: np.ndarray,
-    y_prob: np.ndarray,
-    class_names: list[str] | None = None,
+    y_true: np.ndarray, y_prob: np.ndarray, class_names: list[str] | None = None
 ) -> dict[str, dict[str, float]]:
-    """Compute per-class F1, sensitivity, specificity, AUC-ROC, and calibration.
-
-    Args:
-        y_true: (N, C) binary ground truth.
-        y_prob: (N, C) predicted probabilities in [0, 1].
-        class_names: Defaults to `PATHOLOGY_NAMES`.
-
-    Returns:
-        Dict keyed by class name, each value a dict of metric name -> value.
-        Also includes a "__mean__" key with unweighted means across classes,
-        reported for monitoring only -- never used as the optimization target
-        (see docs/training_strategy.md section 6).
-    """
-    class_names = class_names or PATHOLOGY_NAMES
+    class_names = class_names or NIH_PATHOLOGY_NAMES
     results: dict[str, dict[str, float]] = {}
 
     for i, name in enumerate(class_names):
@@ -75,10 +57,11 @@ def compute_per_class_metrics(
         else:
             auc = roc_auc_score(yt, yp)
 
-        if name in HIGH_URGENCY_CLASSES:
-            threshold = _min_sensitivity_threshold(yt, yp, MIN_SENSITIVITY_FOR_HIGH_URGENCY)
-        else:
-            threshold, _ = _best_f1_threshold(yt, yp)
+        threshold = (
+            _min_sensitivity_threshold(yt, yp, MIN_SENSITIVITY_FOR_HIGH_URGENCY)
+            if name in HIGH_URGENCY_CLASSES
+            else _best_f1_threshold(yt, yp)[0]
+        )
 
         preds = yp >= threshold
         tp = np.sum((preds == 1) & (yt == 1))
@@ -86,20 +69,14 @@ def compute_per_class_metrics(
         fp = np.sum((preds == 1) & (yt == 0))
         fn = np.sum((preds == 0) & (yt == 1))
 
-        sensitivity = tp / max(tp + fn, 1)
-        specificity = tn / max(tn + fp, 1)
-        f1 = f1_score(yt, preds, zero_division=0)
-        brier = brier_score_loss(yt, yp)
-        ece = _expected_calibration_error(yt, yp)
-
         results[name] = {
             "threshold": float(threshold),
-            "f1": float(f1),
-            "sensitivity": float(sensitivity),
-            "specificity": float(specificity),
+            "f1": float(f1_score(yt, preds, zero_division=0)),
+            "sensitivity": float(tp / max(tp + fn, 1)),
+            "specificity": float(tn / max(tn + fp, 1)),
             "auc_roc": float(auc),
-            "brier_score": float(brier),
-            "ece": float(ece),
+            "brier_score": float(brier_score_loss(yt, yp)),
+            "ece": float(_expected_calibration_error(yt, yp)),
             "prevalence": float(yt.mean()),
         }
 
@@ -111,21 +88,17 @@ def compute_per_class_metrics(
 
 
 def _expected_calibration_error(y_true: np.ndarray, y_prob: np.ndarray, num_bins: int = 10) -> float:
-    """Expected Calibration Error: |confidence - accuracy| averaged over probability bins."""
     bin_edges = np.linspace(0.0, 1.0, num_bins + 1)
     ece = 0.0
     for lo, hi in zip(bin_edges[:-1], bin_edges[1:]):
         mask = (y_prob >= lo) & (y_prob < hi)
         if not mask.any():
             continue
-        bin_conf = y_prob[mask].mean()
-        bin_acc = y_true[mask].mean()
-        ece += (mask.sum() / len(y_prob)) * abs(bin_conf - bin_acc)
+        ece += (mask.sum() / len(y_prob)) * abs(y_prob[mask].mean() - y_true[mask].mean())
     return ece
 
 
 def format_metrics_table(results: dict[str, dict[str, float]]) -> str:
-    """Render per-class metrics as a plain-text table for logging."""
     header = f"{'Class':<20}{'F1':>8}{'Sens':>8}{'Spec':>8}{'AUC':>8}{'ECE':>8}{'Prev%':>8}"
     lines = [header, "-" * len(header)]
     for name, m in results.items():

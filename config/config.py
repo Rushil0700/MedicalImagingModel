@@ -1,15 +1,16 @@
-"""Central configuration for ChestXRayMaxVit-v2.
+"""Central configuration for the medical imaging AI system.
 
-All hyperparameters here trace directly back to the Phase 1 design docs:
-docs/enhanced_architecture_spec.md (architecture) and
-docs/training_strategy.md (optimization, loss, data, augmentation).
+Ported from the earlier ChestXRayMaxViT-v2 config with the same
+patient-level split, augmentation, and loss design (that engineering was
+correct and stays); the model section is rebuilt around ChestMedicalNet's
+ConvNeXt backbone + disease-specific pathways.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
 
-PATHOLOGY_NAMES: list[str] = [
+NIH_PATHOLOGY_NAMES: list[str] = [
     "Atelectasis",
     "Cardiomegaly",
     "Effusion",
@@ -26,12 +27,19 @@ PATHOLOGY_NAMES: list[str] = [
     "Hernia",
 ]
 
-# Pathologies where a missed positive (false negative) carries high clinical
-# risk. These classes get a sensitivity floor enforced at threshold-selection
-# time (docs/training_strategy.md, section 6).
+# NIH ChestX-ray14 has no Tuberculosis label at all. The TB pathway below
+# exists structurally (per the project spec's disease-pathway design) but
+# has no genuine training signal on this dataset -- it will only become
+# trainable if a TB-labeled dataset (e.g. Shenzhen, Montgomery, TBX11K) is
+# added separately. Do not interpret its outputs as a real TB classifier
+# until that happens.
+TB_LABEL_AVAILABLE = False
+
+PNEUMONIA_INDEX = NIH_PATHOLOGY_NAMES.index("Pneumonia")
+GENERAL_PATHWAY_NAMES = [c for c in NIH_PATHOLOGY_NAMES if c != "Pneumonia"]  # 13 classes
+
 HIGH_URGENCY_CLASSES: list[str] = ["Pneumothorax", "Pneumonia", "Mass"]
 
-NUM_CLASSES = len(PATHOLOGY_NAMES)
 NUM_SEVERITY_LEVELS = 4  # none / mild / moderate / severe
 
 
@@ -39,9 +47,8 @@ NUM_SEVERITY_LEVELS = 4  # none / mild / moderate / severe
 class DataConfig:
     archive_dir: Path = Path("archive")
     data_entry_csv: Path = Path("archive/Data_Entry_2017.csv")
-    images_glob: str = "archive/images_*/images"
-    splits_dir: Path = Path("data/splits")
-    severity_labels_path: Path | None = None  # see docs note in dataset.py
+    severity_labels_path: Path | None = None
+    tb_labels_path: Path | None = None  # see TB_LABEL_AVAILABLE above
 
     image_size: int = 256
     train_frac: float = 0.70
@@ -62,31 +69,30 @@ class AugmentationConfig:
     brightness_contrast_jitter: float = 0.15
     gaussian_noise_std_frac: float = 0.02
     gaussian_noise_p: float = 0.3
-    # Deliberately absent: vertical_flip, horizontal_flip.
-    # See docs/training_strategy.md section 4 for the medical-safety rationale.
+    # No vertical or horizontal flip -- see docs/training_strategy.md
+    # section 4 for the medical-safety rationale (anatomical plausibility,
+    # laterality markers).
 
 
 @dataclass
-class ModelConfig:
+class ChestModelConfig:
     input_size: int = 256
-    stem_channels: int = 64
-    # Channel widths are unchanged from the baseline (64/128/256/512) -- only
-    # depth increases ([2,2,6,2] -> [3,3,9,3]). Widening channels AND
-    # deepening simultaneously was the original design-doc proposal but
-    # measures out to ~110M backbone params (see docs/enhanced_architecture_spec.md
-    # section 6 correction note), well past the ~50M target. Depth-only
-    # scaling at the original width measures at ~49M backbone params, which
-    # lands on target once FPN/CBAM/head params are added.
-    block_channels: list[int] = field(default_factory=lambda: [64, 128, 256, 512])
-    block_layers: list[int] = field(default_factory=lambda: [3, 3, 9, 3])
+    # ConvNeXt-Large (~198M params) is what the spec calls for, but it is
+    # a tight fit on a free-tier Colab T4 (16GB) once FPN/attention/heads,
+    # gradients, and AdamW's two momentum buffers are added on top. Default
+    # to ConvNeXt-Base (~89M) for practical trainability; set to "large" if
+    # running on a bigger GPU (A100/L4 40GB+).
+    backbone: str = "convnext_base"  # "convnext_base" | "convnext_large"
+    pretrained: bool = True
     fpn_channels: int = 256
     cbam_reduction: int = 16
     head_hidden_dim: int = 512
     mc_dropout_p: float = 0.3
     mc_dropout_passes: int = 20
-    enable_severity_head: bool = True
-    num_classes: int = NUM_CLASSES
+    num_general_classes: int = len(GENERAL_PATHWAY_NAMES)
     num_severity_levels: int = NUM_SEVERITY_LEVELS
+    enable_severity_head: bool = True
+    enable_tb_pathway: bool = True  # architecturally present; see TB_LABEL_AVAILABLE
 
 
 @dataclass
@@ -117,11 +123,11 @@ class OptimConfig:
 class TrainConfig:
     data: DataConfig = field(default_factory=DataConfig)
     aug: AugmentationConfig = field(default_factory=AugmentationConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
+    model: ChestModelConfig = field(default_factory=ChestModelConfig)
     loss: LossConfig = field(default_factory=LossConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
 
     checkpoint_dir: Path = Path("checkpoints")
     log_dir: Path = Path("logs")
     seed: int = 42
-    device: str = "auto"  # "auto" resolves to cuda > mps > cpu
+    device: str = "auto"
